@@ -10,7 +10,7 @@ input = VideoFile("videos/ae41spainpole.mp4")
 
 c = input.detectCircle()
 t = TelemetryData(c)
-t.readSpeed()
+t.readSpeed2()
 # brakes = plotting.removeOutliers(t.brakes, 0.9)
 # brakes = plotting.smoothData(brakes, 5)
 # throttle = plotting.removeOutliers(t.throttle, 0.9)

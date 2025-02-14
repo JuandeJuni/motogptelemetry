@@ -189,127 +189,61 @@ class TelemetryData:
         cap = cv2.VideoCapture(self.circle.videofile.path)
         first_frame = self.circle.firstFrame
         cap.set(cv2.CAP_PROP_POS_FRAMES, first_frame)
-        # Lucas-Kanade Optical Flow parameters
-        lk_params = dict(winSize=(15, 15),
-                        maxLevel=2,
-                        criteria=(cv2.TERM_CRITERIA_EPS | cv2.TERM_CRITERIA_COUNT, 10, 0.03))
+        # Initial bounding box
+        y = self.circle.y - 60
+        x = self.circle.x - 40
+        h = 35
+        w = 75
 
-        # Shi-Tomasi Feature Detection parameters
-        feature_params = dict(maxCorners=50, qualityLevel=0.3, minDistance=7, blockSize=7)
-
-        # Define fixed A & B positions
-        position_A = (self.circle.x+config.windowSpeedUp[0],self.circle.y+config.windowSpeedUp[1],config.windowSpeedUp[2],config.windowSpeedUp[3])  # Adjust based on actual video
-        position_B = (self.circle.x+config.windowSpeedDown[0],self.circle.y+config.windowSpeedDown[1],config.windowSpeedDown[2],config.windowSpeedDown[3])  # Adjust based on actual video
-
-        # Tracking status
-        current_position = "B"  # Start at A
-        tracking_moving = True  # Optical Flow is active only when digits are moving
-        transition_log = []
-
-        # Read first frame
-        ret, first_frame = cap.read()
+        ret, initFrame = cap.read()
         if not ret:
-            print("Error: Could not read video")
-            cap.release()
+            print("Error: Cannot read video frame")
             exit()
 
-        # Convert to grayscale
-        first_gray = cv2.cvtColor(first_frame, cv2.COLOR_BGR2GRAY)
+        # Convert to grayscale for Optical Flow
+        initGray = cv2.cvtColor(initFrame, cv2.COLOR_BGR2GRAY)
 
-        # Start with the fixed ROI at A
-        x, y, w, h = position_B
-        roi_gray = first_gray[y:y+h, x:x+w]
-        p0 = cv2.goodFeaturesToTrack(roi_gray, mask=None, **feature_params)
-
-        # Adjust keypoints to absolute coordinates
-        if p0 is not None:
-            for i in range(p0.shape[0]):
-                p0[i][0][0] += x
-                p0[i][0][1] += y
-
-        frame_count = 0
-        while cap.isOpened():
+        while True:
             ret, frame = cap.read()
             if not ret:
                 break
 
-            frame_count += 1
-            gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+            # Convert current frame to grayscale
+            frameGray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+            frameBlur = cv2.GaussianBlur(frameGray, (5, 5), 0)
+            _, frameGray = cv2.threshold(frameBlur, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
 
-            if tracking_moving:
-                # Compute optical flow when digits are moving
-                if p0 is not None and len(p0) > 0:
-                    p1, st, err = cv2.calcOpticalFlowPyrLK(first_gray, gray, p0, None, **lk_params)
-                    good_new = p1[st == 1]  # Keep only valid keypoints
+            # Compute dense optical flow (Farneback)
+            flow = cv2.calcOpticalFlowFarneback(initGray, frameGray, None, 0.5, 3, 15, 3, 5, 1.2, 0)
 
-                    if len(good_new) > 0:
-                        centroid_x = int(np.mean(good_new[:, 0]))
-                        centroid_y = int(np.mean(good_new[:, 1]))
+            # Extract movement inside bounding box
+            flowX = flow[y:y+h, x:x+w, 0]
+            flowY = flow[y:y+h, x:x+w, 1]
 
-                        # If movement reaches B, switch to B
-                        x_B, y_B, w_B, h_B = position_B
-                        if x_B <= centroid_x <= x_B + w_B and y_B <= centroid_y <= y_B + h_B:
-                            if current_position == "A":
-                                print(f"Transition detected: A → B at frame {frame_count}")
-                                transition_log.append({"Frame": frame_count, "Transition": "A → B"})
-                            current_position = "B"
-                            tracking_moving = False  # Stop Optical Flow, switch to fixed ROI
+            # Compute mean displacement of pixels
+            dx = np.mean(flowX)
+            dy = np.mean(flowY)
 
-                        # If movement reaches A, switch to A
-                        x_A, y_A, w_A, h_A = position_A
-                        if x_A <= centroid_x <= x_A + w_A and y_A <= centroid_y <= y_A + h_A:
-                            if current_position == "B":
-                                print(f"Transition detected: B → A at frame {frame_count}")
-                                transition_log.append({"Frame": frame_count, "Transition": "B → A"})
-                            current_position = "A"
-                            tracking_moving = False  # Stop Optical Flow, switch to fixed ROI
+            # Update bounding box position
+            x += int(dx)
+            y += int(dy)
 
-                        # Update tracking ROI while moving
-                        x, y = centroid_x - w // 2, centroid_y - h // 2
-                        x = max(0, min(x, frame.shape[1] - w))
-                        y = max(0, min(y, frame.shape[0] - h))
+            # Ensure bounding box stays within frame limits
+            x = max(0, min(frame.shape[1] - w, x))
+            y = max(0, min(frame.shape[0] - h, y))
 
-                    # Update previous frame and keypoints
-                    first_gray = gray.copy()
-                    p0 = good_new.reshape(-1, 1, 2)
 
-                else:
-                    # If keypoints are lost, reset to fixed A or B position
-                    tracking_moving = False
+            # **Update the reference frame for optical flow**
+            initGray = frameGray.copy()
 
-            else:
-                # When digits are static, use fixed ROI at A or B
-                if current_position == "A":
-                    x, y, w, h = position_A
-                else:
-                    x, y, w, h = position_B
-
-                # Detect motion: Try finding new keypoints
-                roi_gray = gray[y:y+h, x:x+w]
-                p0 = cv2.goodFeaturesToTrack(roi_gray, mask=None, **feature_params)
-
-                # Convert keypoints to absolute coordinates
-                if p0 is not None:
-                    for i in range(p0.shape[0]):
-                        p0[i][0][0] += x
-                        p0[i][0][1] += y
-
-                # If enough keypoints are detected, start tracking movement
-                if p0 is not None and len(p0) > 10:
-                    tracking_moving = True
-
-            # Draw the ROI
-            cv2.rectangle(frame, (x, y), (x + w, y + h), (255, 0, 0), 2)
-            cv2.putText(frame, f"Tracking: {current_position}", (50, 50), 
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
+            # Draw the updated bounding box
+            cv2.rectangle(frame, (x, y), (x + w, y + h), (0, 255, 0), 2)
 
             # Show result
             cv2.namedWindow("Tracking", cv2.WINDOW_NORMAL)
 
             cv2.imshow("Tracking", frame)
-
-            # Quit with 'Q'
-            if cv2.waitKey(25) & 0xFF == ord('q'):
+            if cv2.waitKey(1) & 0xFF == ord('q'):
                 break
 
         cap.release()
@@ -324,72 +258,72 @@ class TelemetryData:
         cap = cv2.VideoCapture(self.circle.videofile.path)
         first_frame = self.circle.firstFrame
         cap.set(cv2.CAP_PROP_POS_FRAMES, first_frame)
-        position_A_speed = (self.circle.x+config.windowSpeedUp[0],self.circle.y+config.windowSpeedUp[1],config.windowSpeedUp[2],config.windowSpeedUp[3])
-        position_A_kmh = (self.circle.x+config.windowKMHUp[0],self.circle.y+config.windowKMHUp[1],config.windowKMHUp[2],config.windowKMHUp[3])
-        position_B_speed = (self.circle.x+config.windowSpeedDown[0],self.circle.y+config.windowSpeedDown[1],config.windowSpeedDown[2],config.windowSpeedDown[3])
-        position_B_kmh = (self.circle.x+config.windowKMHDown[0],self.circle.y+config.windowKMHDown[1],config.windowKMHDown[2],config.windowKMHDown[3])
+    
+        ret, frame = cap.read()
+        if not ret:
+            print("Failed to read video")
+            cap.release()
+            cv2.destroyAllWindows()
+            exit()
 
-        frame_count = 0
-        speed_tracking = []
+        positionAspeed = (self.circle.x+config.windowSpeedUp[0],self.circle.y+config.windowSpeedUp[1],config.windowSpeedUp[2],config.windowSpeedUp[3])
+        positionBspeed = (self.circle.x+config.windowSpeedDown[0],self.circle.y+config.windowSpeedDown[1],config.windowSpeedDown[2],config.windowSpeedDown[3])
+        positions = [positionAspeed,positionBspeed]
 
+        pos = self.checkSpeedPosition(frame,reader)
+        roi = positions[pos]
+        tracker = cv2.TrackerCSRT_create()
+        tracker.init(frame, roi)
+        print(self.circle.y)
         while cap.isOpened():
             ret, frame = cap.read()
             if not ret:
                 break
 
-            frame_count += 1
-
-            # Extract speed only if "km/h" is detected
-            speed_A = self.extract_speed_if_kmh_easyocr(frame, position_A_speed, position_A_kmh,reader)
-            # speed_A = None
-            speed_B = self.extract_speed_if_kmh_easyocr(frame, position_B_speed, position_B_kmh,reader)
-            # Determine which position has the speed
-            if speed_A:
-                position = "A"
-                speed = speed_A
-            elif speed_B:
-                position = "B"
-                speed = speed_B
-            else:
-                position = "None"
-                speed = None
-
-            # Store tracking data
-            speed_tracking.append({"Frame": frame_count, "Speed": speed, "Position": position})
-
-            # Draw bounding boxes
-            cv2.rectangle(frame, position_A_speed[:2], 
-                        (position_A_speed[0]+position_A_speed[2], position_A_speed[1]+position_A_speed[3]), (0, 255, 0), 2)
-            cv2.rectangle(frame, position_A_kmh[:2], 
-                        (position_A_kmh[0]+position_A_kmh[2], position_A_kmh[1]+position_A_kmh[3]), (0, 255, 0), 2)
-
-            cv2.rectangle(frame, position_B_speed[:2], 
-                        (position_B_speed[0]+position_B_speed[2], position_B_speed[1]+position_B_speed[3]), (0, 0, 255), 2)
-            cv2.rectangle(frame, position_B_kmh[:2], 
-                        (position_B_kmh[0]+position_B_kmh[2], position_B_kmh[1]+position_B_kmh[3]), (0, 0, 255), 2)
-
-            # Display results
-            cv2.putText(frame, f"A Speed: {speed_A}", (position_A_speed[0], position_A_speed[1]-10), 
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
-            cv2.putText(frame, f"B Speed: {speed_B}", (position_B_speed[0], position_B_speed[1]-10), 
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 255), 2)
-            cv2.namedWindow("Tracking", cv2.WINDOW_NORMAL)
+            # Update tracker
+            success, roi = tracker.update(frame)
+            
+            if success:
+                # Draw bounding box
+                x, y, w, h = map(int, roi)
+                print(y)
+                x,_,w,h = positions[pos]
+                if y > self.circle.y:
+                    pos = 1
+                    x,y,w,h = positions[pos]
+                elif y < self.circle.y-40:
+                    pos = 0
+                    x,y,w,h = positions[pos]
+                cv2.rectangle(frame, (x, y), (x + w, y + h), (0, 255, 0), 2)
+            # Extract digits
+            roi = frame[y:y+h,x:x+w]
+            t = self.preprocess_roi(roi)
+            cv2.imshow("thresh",t)
+            speed = self.recognize_digit_easyocr(t,reader)
+            # Display speed number
+            cv2.putText(frame, speed, (x, y - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 2)
+            # Display frame
             cv2.imshow("Tracking", frame)
-
-            # Quit with 'Q'
+            
+            # Exit if 'q' is pressed
             if cv2.waitKey(25) & 0xFF == ord('q'):
                 break
 
+        # Release resources
         cap.release()
         cv2.destroyAllWindows()
-    def preprocess_roi(self,frame, position):
-        x, y, w, h = position
-        roi = frame[y:y+h, x:x+w]
-        frameGray = cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY)
-        # frameBlur = cv2.GaussianBlur(frameGray, (3, 3), 0)
-        # _, thresh = cv2.threshold(frameGray, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+    def preprocess_roi(self,roi):
+        """Preprocess the extracted region for better OCR performance"""
+        gray = cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY)  # Convert to grayscale
+        _, thresh = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY | cv2.THRESH_OTSU)  # Binarization
+        mask = np.zeros_like(thresh)
+        border_size = 2  # Adjust based on your frame
+        mask[border_size:-border_size, border_size:-border_size] = 255  # Keep the inner region
 
-        return frameGray
+        # Apply the mask to the thresholded image
+        thresh_masked = cv2.bitwise_and(thresh, mask)
+        return thresh_masked
+
     def recognize_digit_tesseract(self,thresh):
         config = r'--oem 3 --psm 6 -c tessedit_char_whitelist=0123456789'
         digit = pytesseract.image_to_string(thresh, config=config)
@@ -397,14 +331,12 @@ class TelemetryData:
         return digit.strip() if digit.strip().isdigit() else None
     def recognize_digit_easyocr(self,thresh,reader):
         result = reader.readtext(thresh)
-        return result[0][1] if result and result[0][1].isdigit() else None
-    def detect_kmh_easyocr(self,frame, position,reader):
-        """Detects if 'km/h' text exists in the given region."""
-        thresh = self.preprocess_roi(frame, position)
-        cv2.imshow("gray",thresh)
-        # Run OCR
-        results = reader.readtext(thresh)
-        print(results)
+        for res in result: 
+            if res[1].isdigit():
+                return res[1]
+    def detectWindow(self,firstframe,reader):
+
+        results = reader.readtext(firstframe)
         # Check if "km/h" is detected
         for res in results: 
             if "k" in res[1].lower():
@@ -416,20 +348,24 @@ class TelemetryData:
         if self.detect_kmh_easyocr(frame, kmh_position,reader):  # Ensure 'km/h' is present
             return self.recognize_speed_easyocr(frame, speed_position,reader)
         return None
-    def recognize_speed_easyocr(self,frame, position,reader):
+    def checkSpeedPosition(self,frame,reader):
         """Recognizes speed values using EasyOCR with digit filtering."""
-        thresh = self.preprocess_roi(frame, position)
-
-        # Run OCR
-        results = reader.readtext(thresh)
-
-        # Filter for valid speeds (2-3 digit numbers between 10-300)
-        for res in results:
-            text = res[1].strip()
-            if text.isdigit():
-                num = int(text)
-                return num  # Return as integer
-        return None
+        
+        position_A_kmh = (self.circle.x+config.windowKMHUp[0],self.circle.y+config.windowKMHUp[1],config.windowKMHUp[2],config.windowKMHUp[3])
+        position_B_kmh = (self.circle.x+config.windowKMHDown[0],self.circle.y+config.windowKMHDown[1],config.windowKMHDown[2],config.windowKMHDown[3])
+        roiA = frame[position_A_kmh[1]:position_A_kmh[1]+position_A_kmh[3],position_A_kmh[0]:position_A_kmh[0]+position_A_kmh[2]]
+        roiB = frame[position_B_kmh[1]:position_B_kmh[1]+position_B_kmh[3],position_B_kmh[0]:position_B_kmh[0]+position_B_kmh[2]]
+        resultsA = reader.readtext(roiA)
+        resultsB = reader.readtext(roiB)
+        if resultsA == []:
+            return 1
+        for res in resultsA: 
+            if "k" in res[1].lower():
+                return 0
+            elif "a" or "n" in res[1].lower():
+                return 1
+    # def tracker(self,)
+        
 
 
 
